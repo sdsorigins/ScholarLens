@@ -1,0 +1,171 @@
+"""Normalize heterogeneous scientific section headings to seven roles."""
+
+import logging
+import math
+import re
+from collections.abc import Callable, Sequence
+from functools import lru_cache
+from time import perf_counter
+
+logger = logging.getLogger(__name__)
+
+Vector = Sequence[float]
+EmbedFn = Callable[[list[str]], Sequence[Vector]]
+
+CANONICAL_LABELS = [
+    "Introduction",
+    "Methodology",
+    "Results",
+    "Discussion",
+    "Limitations",
+    "Future Work",
+    "Conclusion",
+]
+
+_KEYWORD_MAP = [
+    ("future work", "Future Work"),
+    ("future direction", "Future Work"),
+    ("threats to validity", "Discussion"),
+    ("related work", "Introduction"),
+    ("prior work", "Introduction"),
+    ("introduction", "Introduction"),
+    ("background", "Introduction"),
+    ("methodology", "Methodology"),
+    ("method", "Methodology"),
+    ("approach", "Methodology"),
+    ("architecture", "Methodology"),
+    ("experiment", "Results"),
+    ("evaluation", "Results"),
+    ("result", "Results"),
+    ("discussion", "Discussion"),
+    ("analysis", "Discussion"),
+    ("limitation", "Limitations"),
+    ("conclusion", "Conclusion"),
+    ("summary", "Conclusion"),
+]
+
+_EXEMPLARS = [
+    "introduction background related work",
+    "methodology methods approach model architecture",
+    "results experiments evaluation findings",
+    "discussion analysis threats to validity",
+    "limitations weaknesses constraints",
+    "future work future directions further research",
+    "conclusion summary closing remarks",
+]
+
+
+def _keyword_match(heading: str) -> str | None:
+    normalized = re.sub(r"^[\d.\s()\-:]+", "", heading.lower()).strip()
+    for phrase, label in _KEYWORD_MAP:
+        if phrase in normalized:
+            return label
+    return None
+
+
+def _cosine_similarity(left: Vector, right: Vector) -> float:
+    dot = sum(a * b for a, b in zip(left, right, strict=False))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+@lru_cache(maxsize=1)
+def get_embedder() -> EmbedFn:
+    """Lazily construct one mean-pooled SciBERT embedder per process."""
+    started = perf_counter()
+    from sentence_transformers import SentenceTransformer
+
+    # sentence-transformers moved these in 6.x. Phase 4 pinned the library back
+    # to 5.x (gliner2[local] caps transformers<5, which 6.x forbids), so accept
+    # both layouts rather than coupling this module to one release line.
+    try:
+        from sentence_transformers.sentence_transformer.modules import (
+            Pooling,
+            Transformer,
+        )
+    except ImportError:  # sentence-transformers < 6
+        from sentence_transformers.models import Pooling, Transformer
+
+    transformer = Transformer("allenai/scibert_scivocab_uncased")
+    pooling = Pooling(transformer.get_embedding_dimension(), pooling_mode="mean")
+    model = SentenceTransformer(modules=[transformer, pooling])
+    logger.info(
+        "Loaded SciBERT allenai/scibert_scivocab_uncased (%d-d) in %.1fs",
+        transformer.get_embedding_dimension(),
+        perf_counter() - started,
+    )
+
+    def embed(texts: list[str]):
+        return model.encode(texts, convert_to_numpy=True)
+
+    return embed
+
+
+def classify_heading(heading: str, embed_fn: EmbedFn | None = None) -> str:
+    """Classify a heading cheaply by keyword, then semantically by SciBERT."""
+    keyword_label = _keyword_match(heading)
+    if keyword_label:
+        return keyword_label
+
+    vectors = (embed_fn or get_embedder())([heading, *_EXEMPLARS])
+    heading_vector = vectors[0]
+    similarities = [
+        _cosine_similarity(heading_vector, exemplar_vector)
+        for exemplar_vector in vectors[1:]
+    ]
+    best_index = max(range(len(CANONICAL_LABELS)), key=similarities.__getitem__)
+    return CANONICAL_LABELS[best_index]
+
+
+def classify_section(heading: str | None) -> str:
+    """Public section classifier; untitled leading material defaults to Introduction."""
+    if not heading or not heading.strip():
+        return "Introduction"
+    return classify_heading(heading)
+
+
+class HeadingClassifier:
+    def __init__(self, embed_fn=None):
+        self.embed_fn = embed_fn
+        self.references = None
+        # O2 telemetry: how many headings each path decided, process-wide. A
+        # caller reads the delta across a stage; nothing here holds text.
+        self.keyword_count = 0
+        self.semantic_count = 0
+
+    def classify_many(self, headings, batch_size=32):
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        labels = [
+            "Introduction" if not h or not h.strip() else _keyword_match(h)
+            for h in headings
+        ]
+        pending = [i for i, label in enumerate(labels) if label is None]
+        self.keyword_count += len(labels) - len(pending)
+        self.semantic_count += len(pending)
+        if not pending:
+            return labels
+        embed = self.embed_fn or get_embedder()
+        if self.references is None:
+            self.references = embed(_EXEMPLARS)
+        for start in range(0, len(pending), batch_size):
+            positions = pending[start : start + batch_size]
+            vectors = embed([headings[i] for i in positions])
+            for i, vector in zip(positions, vectors, strict=True):
+                scores = [_cosine_similarity(vector, ref) for ref in self.references]
+                labels[i] = CANONICAL_LABELS[
+                    max(range(len(scores)), key=scores.__getitem__)
+                ]
+        return labels
+
+
+@lru_cache(maxsize=1)
+def get_heading_classifier():
+    return HeadingClassifier()
+
+
+def classify_sections(headings):
+    return get_heading_classifier().classify_many(headings)
